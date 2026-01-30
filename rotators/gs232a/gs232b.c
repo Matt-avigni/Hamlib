@@ -27,6 +27,8 @@
 #include <string.h>   /* String function definitions */
 // cppcheck-suppress *
 #include <math.h>
+// cppcheck-suppress *
+#include <ctype.h>
 
 #include "hamlib/rotator.h"
 #include "hamlib/port.h"
@@ -36,11 +38,192 @@
 #include "idx_builtin.h"
 
 #define EOM "\r"
-#define REPLY_EOM "\r\n"
-
 #define BUFSZ 64
+#define GS232B_MAX_LINES 3
 
 #define GS232B_LEVELS ROT_LEVEL_SPEED
+
+static char *
+gs232b_trim(char *s)
+{
+    char *end;
+
+    while (*s && isspace((unsigned char) *s))
+    {
+        s++;
+    }
+
+    if (*s == '\0')
+    {
+        return s;
+    }
+
+    end = s + strlen(s) - 1;
+
+    while (end > s && isspace((unsigned char) *end))
+    {
+        *end-- = '\0';
+    }
+
+    return s;
+}
+
+static int
+gs232b_is_prompt(const char *s)
+{
+    if (!s || s[0] == '\0')
+    {
+        return 1;
+    }
+
+    if (strcmp(s, "?>") == 0 || strcmp(s, ">") == 0 || strcmp(s, "OK") == 0)
+    {
+        return 1;
+    }
+
+    if (strncmp(s, "?>", 2) == 0 || strncmp(s, ">", 1) == 0)
+    {
+        return 1;
+    }
+
+    return 0;
+}
+
+static void
+gs232b_escape_line(const char *in, char *out, size_t out_len)
+{
+    size_t o = 0;
+    size_t i;
+
+    if (!out || out_len == 0)
+    {
+        return;
+    }
+
+    for (i = 0; in && in[i] != '\0' && o + 1 < out_len; i++)
+    {
+        unsigned char c = (unsigned char) in[i];
+
+        if (c == '\r' && o + 2 < out_len)
+        {
+            out[o++] = '\\';
+            out[o++] = 'r';
+            continue;
+        }
+
+        if (c == '\n' && o + 2 < out_len)
+        {
+            out[o++] = '\\';
+            out[o++] = 'n';
+            continue;
+        }
+
+        if (c == '\t' && o + 2 < out_len)
+        {
+            out[o++] = '\\';
+            out[o++] = 't';
+            continue;
+        }
+
+        if (c < 0x20 || c == 0x7f)
+        {
+            if (o + 4 < out_len)
+            {
+                SNPRINTF(out + o, out_len - o, "\\x%02X", c);
+                o += 4;
+            }
+            else
+            {
+                break;
+            }
+        }
+        else
+        {
+            out[o++] = (char) c;
+        }
+    }
+
+    out[o] = '\0';
+}
+
+static void
+gs232b_log_rx_lines(const char *cmdstr, char lines[][BUFSZ], int line_count)
+{
+    int i;
+    char escaped[BUFSZ * 4];
+
+    if (line_count <= 0)
+    {
+        rig_debug(RIG_DEBUG_ERR, "%s: No RX data for '%s'\n",
+                  __func__, cmdstr ? cmdstr : "(null)");
+        return;
+    }
+
+    for (i = 0; i < line_count; i++)
+    {
+        gs232b_escape_line(lines[i], escaped, sizeof(escaped));
+        rig_debug(RIG_DEBUG_ERR, "%s: RX[%d] for '%s': '%s'\n",
+                  __func__, i, cmdstr ? cmdstr : "(null)", escaped);
+    }
+}
+
+static int
+gs232b_readline(hamlib_port_t *rotp, char *buf, size_t buflen)
+{
+    size_t idx = 0;
+    unsigned char ch = 0;
+
+    if (!buf || buflen == 0)
+    {
+        return -RIG_EINVAL;
+    }
+
+    buf[0] = '\0';
+
+    while (1)
+    {
+        int res = read_block(rotp, &ch, 1);
+
+        if (res < 0)
+        {
+            return res;
+        }
+
+        if (ch == '\r' || ch == '\n')
+        {
+            break;
+        }
+
+        if (idx + 1 < buflen)
+        {
+            buf[idx++] = (char) ch;
+        }
+        else
+        {
+            /* Discard until EOL to keep the stream aligned. */
+            while (1)
+            {
+                res = read_block(rotp, &ch, 1);
+
+                if (res < 0)
+                {
+                    return res;
+                }
+
+                if (ch == '\r' || ch == '\n')
+                {
+                    break;
+                }
+            }
+
+            break;
+        }
+    }
+
+    buf[idx] = '\0';
+
+    return (int) idx;
+}
 
 /**
  * gs232b_transaction
@@ -65,6 +248,7 @@ gs232b_transaction(ROT *rot, const char *cmdstr,
     hamlib_port_t *rotp = ROTPORT(rot);
     int retval;
     int retry_read = 0;
+    const int max_lines = GS232B_MAX_LINES;
 
 transaction_write:
 
@@ -81,7 +265,13 @@ transaction_write:
 
         if (!data)
         {
-            write_block(rotp, (unsigned char *) EOM, strlen(EOM));
+            size_t cmd_len = strlen(cmdstr);
+            char last = cmd_len > 0 ? cmdstr[cmd_len - 1] : '\0';
+
+            if (last != '\r' && last != '\n')
+            {
+                write_block(rotp, (unsigned char *) EOM, strlen(EOM));
+            }
         }
     }
 
@@ -100,15 +290,70 @@ transaction_write:
 
 
     memset(data, 0, data_len);
-    retval = read_string(rotp, (unsigned char *) data, data_len,
-                         REPLY_EOM, strlen(REPLY_EOM), 0, 1);
 
-    if (strncmp(data, "\r\n", 2) == 0 || strchr(data, '>'))
     {
-        rig_debug(RIG_DEBUG_ERR, "%s: Invalid response for '%s': '%s' (length=%d)\n",
-                  __func__, cmdstr, data, (int) strlen(data));
-        dump_hex((unsigned char *)data, strlen(data));
-        retval = -RIG_EPROTO; // force retry
+        int i;
+        int got_line = 0;
+        char raw_lines[GS232B_MAX_LINES][BUFSZ];
+        int raw_count = 0;
+
+        for (i = 0; i < max_lines; i++)
+        {
+            char linebuf[BUFSZ];
+            char workbuf[BUFSZ];
+            char *trimmed;
+
+            retval = gs232b_readline(rotp, linebuf, sizeof(linebuf));
+
+            if (retval < 0)
+            {
+                break;
+            }
+
+            if (raw_count < max_lines)
+            {
+                strncpy(raw_lines[raw_count], linebuf, sizeof(raw_lines[raw_count]) - 1);
+                raw_lines[raw_count][sizeof(raw_lines[raw_count]) - 1] = '\0';
+                raw_count++;
+            }
+
+            strncpy(workbuf, linebuf, sizeof(workbuf) - 1);
+            workbuf[sizeof(workbuf) - 1] = '\0';
+            trimmed = gs232b_trim(workbuf);
+
+            if (gs232b_is_prompt(trimmed))
+            {
+                continue;
+            }
+
+            if (data_len > 0)
+            {
+                strncpy(data, trimmed, data_len - 1);
+                data[data_len - 1] = '\0';
+            }
+
+            got_line = 1;
+            retval = RIG_OK;
+            break;
+        }
+
+        if (!got_line)
+        {
+            if (retval >= 0)
+            {
+                retval = -RIG_EPROTO;
+            }
+
+            gs232b_log_rx_lines(cmdstr, raw_lines, raw_count);
+        }
+        else if (data[0] == '?')
+        {
+            /* Invalid command */
+            rig_debug(RIG_DEBUG_VERBOSE, "%s: Error for '%s': '%s'\n",
+                      __func__, cmdstr, data);
+            gs232b_log_rx_lines(cmdstr, raw_lines, raw_count);
+            retval = -RIG_EPROTO;
+        }
     }
 
 
@@ -158,15 +403,6 @@ https://github.com/Hamlib/Hamlib/issues/272
 
 #endif
 
-    if (data[0] == '?')
-    {
-        /* Invalid command */
-        rig_debug(RIG_DEBUG_VERBOSE, "%s: Error for '%s': '%s'\n",
-                  __func__, cmdstr, data);
-        retval = -RIG_EPROTO;
-        goto transaction_quit;
-    }
-
     retval = RIG_OK;
 transaction_quit:
     return retval;
@@ -211,13 +447,15 @@ static int
 gs232b_rot_get_position(ROT *rot, azimuth_t *az, elevation_t *el)
 {
     char posbuf[32];
-    int retval, int_az = 0, int_el = 0;
+    int retval;
+    double az_val = 0.0, el_val = 0.0;
+    int parsed = 0;
 
     rig_debug(RIG_DEBUG_TRACE, "%s called\n", __func__);
 
     retval = gs232b_transaction(rot, "C2" EOM, posbuf, sizeof(posbuf), 0);
 
-    if (retval != RIG_OK || strlen(posbuf) < 10)
+    if (retval != RIG_OK || posbuf[0] == '\0')
     {
         return retval < 0 ? retval : -RIG_EPROTO;
     }
@@ -227,18 +465,32 @@ gs232b_rot_get_position(ROT *rot, azimuth_t *az, elevation_t *el)
     /* With the format string containing a space character as one of the
      * directives, any amount of space is matched, including none in the input.
      */
-    // There's a 12PR1A rotor  that only returns AZ so we may only get AZ=xxx
-    if (sscanf(posbuf, "AZ=%d EL=%d", &int_az, &int_el) <= 0)
+    // There's a 12PR1A rotor that only returns AZ so we may only get AZ=xxx
+    parsed = sscanf(posbuf, "AZ=%lf EL=%lf", &az_val, &el_val);
+
+    if (parsed <= 0)
+    {
+        parsed = sscanf(posbuf, "%lf %lf", &az_val, &el_val);
+    }
+
+    if (parsed <= 0)
     {
         // only give error if we didn't parse anything
+        char escaped[BUFSZ * 4];
+        gs232b_escape_line(posbuf, escaped, sizeof(escaped));
         rig_debug(RIG_DEBUG_ERR, "%s: wrong reply '%s', expected AZ=xxx EL=xxx\n",
                   __func__,
-                  posbuf);
+                  escaped);
         return -RIG_EPROTO;
     }
 
-    *az = (azimuth_t) int_az;
-    *el = (elevation_t) int_el;
+    if (parsed == 1)
+    {
+        el_val = 0.0;
+    }
+
+    *az = (azimuth_t) az_val;
+    *el = (elevation_t) el_val;
 
     rig_debug(RIG_DEBUG_TRACE, "%s: (az, el) = (%.0f, %.0f)\n",
               __func__, *az, *el);
