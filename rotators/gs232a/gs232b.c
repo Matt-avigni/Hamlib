@@ -29,6 +29,8 @@
 #include <math.h>
 // cppcheck-suppress *
 #include <ctype.h>
+// cppcheck-suppress *
+#include <stdlib.h>
 
 #include "hamlib/rotator.h"
 #include "hamlib/port.h"
@@ -165,6 +167,148 @@ gs232b_log_rx_lines(const char *cmdstr, char lines[][BUFSZ], int line_count)
         rig_debug(RIG_DEBUG_ERR, "%s: RX[%d] for '%s': '%s'\n",
                   __func__, i, cmdstr ? cmdstr : "(null)", escaped);
     }
+}
+
+static int
+gs232b_extract_az_el_from_buf(const char *buf, double *az, double *el, int *have_el)
+{
+    char linebuf[BUFSZ];
+    const char *cursor;
+
+    if (!buf || !az || !el || !have_el)
+    {
+        return 0;
+    }
+
+    *have_el = 0;
+    cursor = buf;
+
+    while (*cursor)
+    {
+        size_t len = 0;
+        char *trimmed;
+
+        while (cursor[len] && cursor[len] != '\r' && cursor[len] != '\n')
+        {
+            if (len + 1 < sizeof(linebuf))
+            {
+                linebuf[len++] = cursor[len];
+            }
+            else
+            {
+                break;
+            }
+        }
+
+        linebuf[len] = '\0';
+
+        while (*cursor && *cursor != '\r' && *cursor != '\n')
+        {
+            cursor++;
+        }
+
+        while (*cursor == '\r' || *cursor == '\n')
+        {
+            cursor++;
+        }
+
+        trimmed = gs232b_trim(linebuf);
+
+        if (gs232b_is_prompt(trimmed))
+        {
+            continue;
+        }
+
+        {
+            const char *az_tag = strstr(trimmed, "AZ");
+            const char *p;
+            char *endptr = NULL;
+            double az_val;
+
+            if (!az_tag)
+            {
+                continue;
+            }
+
+            p = az_tag + 2;
+            while (*p && isspace((unsigned char) *p))
+            {
+                p++;
+            }
+
+            if (*p != '=')
+            {
+                continue;
+            }
+
+            p++;
+            while (*p && isspace((unsigned char) *p))
+            {
+                p++;
+            }
+
+            if (*p == '\0')
+            {
+                continue;
+            }
+
+            az_val = strtod(p, &endptr);
+
+            if (endptr == p)
+            {
+                continue;
+            }
+
+            *az = az_val;
+
+            {
+                const char *el_tag = strstr(endptr, "EL");
+
+                if (!el_tag)
+                {
+                    return 1;
+                }
+
+                p = el_tag + 2;
+                while (*p && isspace((unsigned char) *p))
+                {
+                    p++;
+                }
+
+                if (*p != '=')
+                {
+                    return 1;
+                }
+
+                p++;
+                while (*p && isspace((unsigned char) *p))
+                {
+                    p++;
+                }
+
+                if (*p == '\0')
+                {
+                    return 1;
+                }
+
+                {
+                    char *elend = NULL;
+                    double el_val = strtod(p, &elend);
+
+                    if (elend == p)
+                    {
+                        return 1;
+                    }
+
+                    *el = el_val;
+                    *have_el = 1;
+                    return 1;
+                }
+            }
+        }
+    }
+
+    return 0;
 }
 
 static int
@@ -446,45 +590,81 @@ gs232b_rot_set_position(ROT *rot, azimuth_t az, elevation_t el)
 static int
 gs232b_rot_get_position(ROT *rot, azimuth_t *az, elevation_t *el)
 {
-    char posbuf[32];
+    char linebuf[BUFSZ];
+    char workbuf[BUFSZ];
+    char escaped[BUFSZ * 4];
     int retval;
     double az_val = 0.0, el_val = 0.0;
-    int parsed = 0;
+    int have_el = 0;
+    int got_az = 0;
+    int attempt;
+    const int max_attempts = 3;
+    const int max_lines = GS232B_MAX_LINES + 3;
+    hamlib_port_t *rotp = ROTPORT(rot);
 
     rig_debug(RIG_DEBUG_TRACE, "%s called\n", __func__);
 
-    retval = gs232b_transaction(rot, "C2" EOM, posbuf, sizeof(posbuf), 0);
-
-    if (retval != RIG_OK || posbuf[0] == '\0')
+    for (attempt = 0; attempt < max_attempts && !got_az; attempt++)
     {
-        return retval < 0 ? retval : -RIG_EPROTO;
+        int lines_read = 0;
+
+        if (attempt == 0)
+        {
+            rig_flush(rotp);
+        }
+
+        retval = write_block(rotp, (unsigned char *) "C2" EOM, strlen("C2" EOM));
+
+        if (retval != RIG_OK)
+        {
+            return retval;
+        }
+
+        while (lines_read < max_lines)
+        {
+            retval = gs232b_readline(rotp, linebuf, sizeof(linebuf));
+
+            if (retval < 0)
+            {
+                break;
+            }
+
+            lines_read++;
+
+            if (gs232b_extract_az_el_from_buf(linebuf, &az_val, &el_val, &have_el))
+            {
+                got_az = 1;
+                break;
+            }
+
+            strncpy(workbuf, linebuf, sizeof(workbuf) - 1);
+            workbuf[sizeof(workbuf) - 1] = '\0';
+            gs232b_escape_line(workbuf, escaped, sizeof(escaped));
+
+            rig_debug(RIG_DEBUG_TRACE, "%s: ignoring junk line '%s'\n",
+                      __func__, escaped);
+        }
+
+        if (got_az)
+        {
+            break;
+        }
+
+        if (retval < 0 && retval != -RIG_ETIMEOUT)
+        {
+            return retval;
+        }
     }
 
-    /* parse "AZ=aaa   EL=eee" */
-
-    /* With the format string containing a space character as one of the
-     * directives, any amount of space is matched, including none in the input.
-     */
-    // There's a 12PR1A rotor that only returns AZ so we may only get AZ=xxx
-    parsed = sscanf(posbuf, "AZ=%lf EL=%lf", &az_val, &el_val);
-
-    if (parsed <= 0)
+    if (!got_az)
     {
-        parsed = sscanf(posbuf, "%lf %lf", &az_val, &el_val);
-    }
-
-    if (parsed <= 0)
-    {
-        // only give error if we didn't parse anything
-        char escaped[BUFSZ * 4];
-        gs232b_escape_line(posbuf, escaped, sizeof(escaped));
-        rig_debug(RIG_DEBUG_ERR, "%s: wrong reply '%s', expected AZ=xxx EL=xxx\n",
-                  __func__,
-                  escaped);
+        rig_debug(RIG_DEBUG_ERR,
+                  "%s: no valid AZ= reply after %d attempt(s)\n",
+                  __func__, max_attempts);
         return -RIG_EPROTO;
     }
 
-    if (parsed == 1)
+    if (!have_el)
     {
         el_val = 0.0;
     }
