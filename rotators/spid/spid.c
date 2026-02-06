@@ -20,6 +20,7 @@
  */
 
 
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -55,6 +56,90 @@ enum r2p_frame_parser_state
     ROT2PROG_PARSER_EXPECT_LF,
     ROT2PROG_PARSER_EXPECT_FRAME_END,
 };
+
+static int spid_digit_from_byte(unsigned char byte, int *digit)
+{
+    if (byte >= '0' && byte <= '9')
+    {
+        *digit = byte - '0';
+        return 1;
+    }
+
+    if (byte <= 9)
+    {
+        *digit = byte;
+        return 1;
+    }
+
+    return 0;
+}
+
+static int spid_decode_decimal(const unsigned char *buf, size_t digits,
+                               double *value, char *out, size_t out_len)
+{
+    int d[4] = { 0, 0, 0, 0 };
+    size_t i;
+    char *endp = NULL;
+
+    if (digits < 3 || digits > 4)
+    {
+        return -RIG_EINVAL;
+    }
+
+    for (i = 0; i < digits; i++)
+    {
+        if (!spid_digit_from_byte(buf[i], &d[i]))
+        {
+            return -RIG_EPROTO;
+        }
+    }
+
+    if (digits == 3)
+    {
+        SNPRINTF(out, out_len, "%d%d%d", d[0], d[1], d[2]);
+    }
+    else
+    {
+        SNPRINTF(out, out_len, "%d%d%d.%d", d[0], d[1], d[2], d[3]);
+    }
+
+    *value = strtod(out, &endp);
+
+    if (endp == out)
+    {
+        return -RIG_EPROTO;
+    }
+
+    return RIG_OK;
+}
+
+static void spid_log_raw_frame(const char *ctx, const unsigned char *buf, size_t len)
+{
+    char hexbuf[3 * 12 + 1];
+    char ascbuf[12 + 1];
+    size_t i;
+    size_t off = 0;
+
+    if (!buf || len == 0)
+    {
+        return;
+    }
+
+    for (i = 0; i < len && off + 3 < sizeof(hexbuf); i++)
+    {
+        off += SNPRINTF(hexbuf + off, sizeof(hexbuf) - off, "%02X ", buf[i]);
+    }
+
+    for (i = 0; i < len && i + 1 < sizeof(ascbuf); i++)
+    {
+        ascbuf[i] = isprint((unsigned char)buf[i]) ? (char)buf[i] : '.';
+    }
+
+    ascbuf[i] = '\0';
+
+    rig_debug(RIG_DEBUG_VERBOSE, "%s: raw response (%zu bytes): hex=%s ascii='%s'\n",
+              ctx, len, hexbuf, ascbuf);
+}
 
 static int read_r2p_frame(hamlib_port_t *port, unsigned char *rxbuffer,
                           size_t count)
@@ -436,7 +521,12 @@ static int spid_rot_get_position(ROT *rot, azimuth_t *az, elevation_t *el)
     hamlib_port_t *rotp = ROTPORT(rot);
     int retval;
     int retry_read = 0;
-    char posbuf[12];
+    unsigned char posbuf[12];
+    double az_raw = 0.0;
+    double el_raw = 0.0;
+    char az_str[8] = { 0 };
+    char el_str[8] = { 0 };
+    size_t resp_len = 0;
 
     rig_debug(RIG_DEBUG_TRACE, "%s called\n", __func__);
 
@@ -454,12 +544,14 @@ static int spid_rot_get_position(ROT *rot, azimuth_t *az, elevation_t *el)
 
         if (rot->caps->rot_model == ROT_MODEL_SPID_ROT1PROG)
         {
-            retval = read_r2p_frame(rotp, (unsigned char *) posbuf, 5);
+            resp_len = 5;
+            retval = read_r2p_frame(rotp, posbuf, resp_len);
         }
         else if (rot->caps->rot_model == ROT_MODEL_SPID_ROT2PROG ||
                  rot->caps->rot_model == ROT_MODEL_SPID_MD01_ROT2PROG)
         {
-            retval = read_r2p_frame(rotp, (unsigned char *) posbuf, 12);
+            resp_len = 12;
+            retval = read_r2p_frame(rotp, posbuf, resp_len);
         }
         else
         {
@@ -473,29 +565,45 @@ static int spid_rot_get_position(ROT *rot, azimuth_t *az, elevation_t *el)
         return retval;
     }
 
-    *az  = posbuf[1] * 100;
-    *az += posbuf[2] * 10;
-    *az += posbuf[3];
+    spid_log_raw_frame(__func__, posbuf, resp_len);
 
     if (rot->caps->rot_model == ROT_MODEL_SPID_ROT2PROG ||
             rot->caps->rot_model == ROT_MODEL_SPID_MD01_ROT2PROG)
     {
-        *az += posbuf[4] / 10.0;
+        retval = spid_decode_decimal(posbuf + 1, 4, &az_raw, az_str, sizeof(az_str));
+    }
+    else
+    {
+        retval = spid_decode_decimal(posbuf + 1, 3, &az_raw, az_str, sizeof(az_str));
     }
 
-    *az -= 360;
+    if (retval != RIG_OK)
+    {
+        rig_debug(RIG_DEBUG_ERR, "%s: invalid azimuth response\n", __func__);
+        return retval;
+    }
+
+    *az = (azimuth_t)(az_raw - 360.0);
 
     *el = 0.0;
 
     if (rot->caps->rot_model == ROT_MODEL_SPID_ROT2PROG ||
             rot->caps->rot_model == ROT_MODEL_SPID_MD01_ROT2PROG)
     {
-        *el  = posbuf[6] * 100;
-        *el += posbuf[7] * 10;
-        *el += posbuf[8];
-        *el += posbuf[9] / 10.0;
-        *el -= 360;
+        retval = spid_decode_decimal(posbuf + 6, 4, &el_raw, el_str, sizeof(el_str));
+
+        if (retval != RIG_OK)
+        {
+            rig_debug(RIG_DEBUG_ERR, "%s: invalid elevation response\n", __func__);
+            return retval;
+        }
+
+        *el = (elevation_t)(el_raw - 360.0);
     }
+
+    rig_debug(RIG_DEBUG_VERBOSE, "%s: parsed az=%.3f el=%.3f (raw az=%s el=%s)\n",
+              __func__, (double)*az, (double)*el,
+              az_str[0] ? az_str : "(n/a)", el_str[0] ? el_str : "(n/a)");
 
     rig_debug(RIG_DEBUG_TRACE, "%s: (az, el) = (%.1f, %.1f)\n",
               __func__, *az, *el);

@@ -266,6 +266,15 @@ the set command:
 Rot1Prog does not use H4 and uses H1 for houndres, while Rot2Prog uses
 H4 for ones and H1 for thousands.
 
+LOCAL TEST
+----------
+
+Example manual check (rotctld must be running against your SPID device):
+
+    rotctl -m 902 -r /dev/XXX -s 115200 p
+
+With the rotor positioned between whole degrees, the returned az/el should
+include non-integer decimals (e.g. 123.2 / 45.6).
 
 
 SEE ALSO
