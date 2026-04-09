@@ -127,7 +127,8 @@ static void spid_log_raw_frame(const char *ctx, const unsigned char *buf, size_t
 
     for (i = 0; i < len && off + 3 < sizeof(hexbuf); i++)
     {
-        off += SNPRINTF(hexbuf + off, sizeof(hexbuf) - off, "%02X ", buf[i]);
+        SNPRINTF(hexbuf + off, sizeof(hexbuf) - off, "%02X ", buf[i]);
+        off += 3;
     }
 
     for (i = 0; i < len && i + 1 < sizeof(ascbuf); i++)
